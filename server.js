@@ -109,3 +109,62 @@ app.post('/api/agent/upload', async (req, res) => {
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+
+// GET /api/sales-summary?days=90
+// Returns [{ customer, invoices, total }] for the last N days (default 90)
+app.get('/api/sales-summary', async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ ok:false, error:'Supabase not configured' });
+
+    const days = Math.max(1, parseInt(req.query.days || '90', 10));
+    const fromIso = new Date(Date.now() - days*24*3600*1000).toISOString().slice(0,10); // YYYY-MM-DD
+
+    // fetch vouchers in range (only what we need)
+    const { data, error } = await supabase
+      .from('vouchers')
+      .select('voucher_date, payload')
+      .gte('voucher_date', fromIso)
+      .lte('voucher_date', new Date().toISOString().slice(0,10))
+      .limit(5000); // safety cap for now
+
+    if (error) throw error;
+
+    // group totals by PARTYLEDGERNAME
+    const totals = new Map();
+    const counts = new Map();
+
+    function toNumber(x) {
+      if (x == null) return 0;
+      const n = Number(String(x).replace(/[^0-9.\-]/g, ''));
+      return isNaN(n) ? 0 : n;
+    }
+
+    for (const row of (data || [])) {
+      const v = row.payload || {};
+      const customer = v.PARTYLEDGERNAME || v.partyledgername || 'Unknown';
+
+      // voucher total: prefer sum of line items; else use voucher AMOUNT
+      let vTotal = 0;
+      const inv = v['ALLINVENTORYENTRIES.LIST'];
+      if (inv) {
+        const list = Array.isArray(inv) ? inv : [inv];
+        for (const it of list) vTotal += toNumber(it && (it.AMOUNT || it.amount));
+      } else {
+        vTotal = toNumber(v.AMOUNT || v.amount);
+      }
+
+      totals.set(customer, (totals.get(customer) || 0) + vTotal);
+      counts.set(customer, (counts.get(customer) || 0) + 1);
+    }
+
+    // format + sort
+    const rows = Array.from(totals.entries())
+      .map(([customer, total]) => ({ customer, invoices: counts.get(customer) || 0, total }))
+      .sort((a,b) => b.total - a.total);
+
+    res.json({ ok:true, days, rows });
+  } catch (e) {
+    console.error('sales-summary error:', e);
+    res.status(500).json({ ok:false, error: e.message || String(e) });
+  }
+});
